@@ -50,7 +50,7 @@ export async function POST(request: Request) {
     receivedAt: new Date().toISOString(),
   };
 
-  addWaitlistSignup(email, signup.firstName, signup.interest);
+  await addWaitlistSignup(email, signup.firstName, signup.interest);
 
   return NextResponse.json({ ok: true });
 }

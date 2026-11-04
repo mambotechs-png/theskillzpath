@@ -51,7 +51,7 @@ export async function POST(request: Request) {
   // Only a confirmed SUCCESS grants founding member access.
   if (status === "SUCCESS") {
     try {
-      const member = markMemberPaidByReference(
+      const member = await markMemberPaidByReference(
         reference,
         email,
         site.pricing.earlyBird,

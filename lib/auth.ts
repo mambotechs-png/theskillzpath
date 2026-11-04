@@ -84,7 +84,7 @@ export async function getSessionEmailFromRequest(
   if (!token) return null;
   const email = await verifySessionToken(token);
   if (!email) return null;
-  const member = getMemberByEmail(email);
+  const member = await getMemberByEmail(email);
   if (!member || member.accessStatus !== "ACTIVE") return null;
   return email;
 }
@@ -95,7 +95,7 @@ export async function getSessionEmail(): Promise<string | null> {
   if (!token) return null;
   const email = await verifySessionToken(token);
   if (!email) return null;
-  const member = getMemberByEmail(email);
+  const member = await getMemberByEmail(email);
   if (!member || member.accessStatus !== "ACTIVE") return null;
   return email;
 }

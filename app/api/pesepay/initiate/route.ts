@@ -64,7 +64,7 @@ export async function POST(request: Request) {
     });
 
     // Persist the early-access member while the payment is being processed.
-    saveMember({
+    await saveMember({
       email,
       firstName: name.split(" ")[0] ?? "",
       lastName: name.split(" ").slice(1).join(" ") ?? "",
