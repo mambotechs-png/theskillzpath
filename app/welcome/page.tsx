@@ -32,7 +32,7 @@ export default async function WelcomePage({
   const email = typeof emailParam === "string" ? emailParam.trim().toLowerCase() : "";
   const memberEmail = email;
 
-  let member = memberEmail ? getMemberByEmail(memberEmail) : null;
+  let member = memberEmail ? await getMemberByEmail(memberEmail) : null;
 
   // Read the real transaction status from Pesepay whenever a reference is present.
   let paymentOutcome: "paid" | "pending" | "failed" = "pending";
@@ -43,7 +43,7 @@ export default async function WelcomePage({
     transactionStatus = check.status;
     paymentOutcome = check.outcome;
     if (paymentOutcome === "paid") {
-      member = markMemberPaidByReference(ref, memberEmail);
+      member = await markMemberPaidByReference(ref, memberEmail);
     }
   }
 

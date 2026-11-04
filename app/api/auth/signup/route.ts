@@ -37,7 +37,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Password is required." }, { status: 422 });
   }
 
-  const member = saveMember({
+  const member = await saveMember({
     email,
     firstName,
     interest,

@@ -1,62 +1,16 @@
-import { DatabaseSync } from "node:sqlite";
 import crypto from "node:crypto";
+import { eq } from "drizzle-orm";
+import { db } from "@/db";
+import { members, waitlist, type MemberRow } from "@/db/schema";
 import { site } from "./site";
 
 /**
- * Thin data layer for SkillzPath using the built-in SQLite engine
- * (node:sqlite, available in Node 22.5+). The database file lives at
- * DATABASE_PATH and defaults to ./data/skillzpath.db.
+ * Data layer for SkillzPath, backed by Netlify Database (managed Postgres).
  *
- * Tables:
+ * Tables (see db/schema.ts):
  *  - members:  early-access / founding members who paid (or attempted to pay)
  *  - waitlist: email-only early-access reservations collected before launch
  */
-
-const DATABASE_PATH = process.env.DATABASE_PATH ?? "data/skillzpath.db";
-
-let db: DatabaseSync | null = null;
-
-function getDb(): DatabaseSync {
-  if (db) return db;
-
-  const database = new DatabaseSync(DATABASE_PATH);
-  database.exec(`
-    PRAGMA journal_mode = WAL;
-    PRAGMA foreign_keys = ON;
-
-    CREATE TABLE IF NOT EXISTS members (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      email TEXT NOT NULL UNIQUE,
-      first_name TEXT NOT NULL DEFAULT '',
-      last_name TEXT NOT NULL DEFAULT '',
-      phone TEXT NOT NULL DEFAULT '',
-      country TEXT NOT NULL DEFAULT '',
-      city TEXT NOT NULL DEFAULT '',
-      age_group TEXT NOT NULL DEFAULT '',
-      interest TEXT NOT NULL DEFAULT '',
-      experience TEXT NOT NULL DEFAULT '',
-      goal TEXT NOT NULL DEFAULT '',
-      source TEXT NOT NULL DEFAULT '',
-      agree_updates INTEGER NOT NULL DEFAULT 1,
-      payment_status TEXT NOT NULL DEFAULT 'PENDING',
-      access_status TEXT NOT NULL DEFAULT 'RESERVED',
-      amount_paid REAL NOT NULL DEFAULT 0,
-      reference_number TEXT NOT NULL DEFAULT '',
-      password_hash TEXT NOT NULL DEFAULT '',
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS waitlist (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      email TEXT NOT NULL UNIQUE,
-      created_at TEXT NOT NULL
-    );
-  `);
-
-  db = database;
-  return db;
-}
 
 export type MemberStatus = "PENDING" | "PAID" | "FAILED";
 
@@ -85,28 +39,14 @@ export type Member = {
   passwordHash: string;
 };
 
-function toMember(row: Record<string, unknown>): Member {
+function toMember(row: MemberRow): Member {
   return {
-    id: String(row.id ?? ""),
-    email: String(row.email ?? ""),
-    firstName: String(row.first_name ?? ""),
-    lastName: String(row.last_name ?? ""),
-    phone: String(row.phone ?? ""),
-    country: String(row.country ?? ""),
-    city: String(row.city ?? ""),
-    ageGroup: String(row.age_group ?? ""),
-    interest: String(row.interest ?? ""),
-    experience: String(row.experience ?? ""),
-    goal: String(row.goal ?? ""),
-    source: String(row.source ?? ""),
-    agreeUpdates: Number(row.agree_updates ?? 1) === 1,
-    paymentStatus: (String(row.payment_status ?? "PENDING") || "PENDING") as MemberStatus,
-    accessStatus: (String(row.access_status ?? "RESERVED") || "RESERVED") as MemberAccess,
-    amountPaid: Number(row.amount_paid ?? 0),
-    referenceNumber: String(row.reference_number ?? ""),
-    createdAt: String(row.created_at ?? ""),
-    updatedAt: String(row.updated_at ?? ""),
-    passwordHash: String(row.password_hash ?? ""),
+    ...row,
+    id: String(row.id),
+    paymentStatus: (row.paymentStatus || "PENDING") as MemberStatus,
+    accessStatus: (row.accessStatus || "RESERVED") as MemberAccess,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
   };
 }
 
@@ -132,7 +72,6 @@ export type SaveMemberInput = {
 
 function hashPassword(password: string): string {
   if (!password) return "";
-  // Use Node.js crypto PBKDF2 for password hashing
   const salt = crypto.randomBytes(16).toString("hex");
   const dk = crypto.scryptSync(password, salt, 64);
   return `${salt}.${dk.toString("hex")}`;
@@ -145,176 +84,141 @@ export function verifyPassword(password: string, hash: string): boolean {
   const [salt, storedKey] = parts;
   try {
     const dk = crypto.scryptSync(password, salt, 64);
-    return dk.toString("hex") === storedKey;
+    const stored = Buffer.from(storedKey, "hex");
+    return stored.length === dk.length && crypto.timingSafeEqual(dk, stored);
   } catch {
     return false;
   }
 }
 
-export function saveMember(input: SaveMemberInput): Member | null {
-  const database = getDb();
-  const now = new Date().toISOString();
+// Strip HTML tags and control chars before persisting free-text fields.
+// React already escapes on render; this is defense-in-depth server-side.
+function sanitizeText(value: string | undefined, max = 160): string {
+  return String(value ?? "")
+    .replace(/<[^>]*>/g, "")
+    .replace(/[\r\n\t]/g, " ")
+    .trim()
+    .slice(0, max);
+}
+
+async function findMemberRow(email: string): Promise<MemberRow | undefined> {
+  const [row] = await db.select().from(members).where(eq(members.email, email)).limit(1);
+  return row;
+}
+
+export async function saveMember(input: SaveMemberInput): Promise<Member | null> {
   const email = input.email.trim().toLowerCase();
+  const existing = await findMemberRow(email);
 
-  // Hash password if provided
-  const passwordHash = input.password ? hashPassword(input.password) : "";
-
-  function sanitizeText(value: string, max = 160): string {
-    // Strip HTML tags and control chars before persisting free-text fields.
-    // React already escapes on render; this is defense-in-depth server-side.
-    return value
-      .replace(/<[^>]*>/g, "")
-      .replace(/[\r\n\t]/g, " ")
-      .trim()
-      .slice(0, max);
+  if (existing) {
+    const [updated] = await db
+      .update(members)
+      .set({
+        firstName: input.firstName !== undefined ? sanitizeText(input.firstName, 80) : existing.firstName,
+        lastName: input.lastName !== undefined ? sanitizeText(input.lastName, 80) : existing.lastName,
+        phone: input.phone !== undefined ? sanitizeText(input.phone) : existing.phone,
+        country: input.country !== undefined ? sanitizeText(input.country) : existing.country,
+        city: input.city !== undefined ? sanitizeText(input.city) : existing.city,
+        ageGroup: input.ageGroup !== undefined ? sanitizeText(input.ageGroup) : existing.ageGroup,
+        interest: input.interest !== undefined ? sanitizeText(input.interest) : existing.interest,
+        experience: input.experience !== undefined ? sanitizeText(input.experience) : existing.experience,
+        goal: input.goal !== undefined ? sanitizeText(input.goal) : existing.goal,
+        source: input.source !== undefined ? sanitizeText(input.source) : existing.source,
+        agreeUpdates: input.agreeUpdates ?? existing.agreeUpdates,
+        // Never downgrade a member who has already paid.
+        paymentStatus: existing.paymentStatus === "PAID" ? "PAID" : input.paymentStatus ?? existing.paymentStatus,
+        accessStatus: existing.accessStatus === "ACTIVE" ? "ACTIVE" : input.accessStatus ?? existing.accessStatus,
+        amountPaid: existing.paymentStatus === "PAID" ? existing.amountPaid : input.amountPaid ?? existing.amountPaid,
+        referenceNumber:
+          input.referenceNumber !== undefined ? sanitizeText(input.referenceNumber, 80) : existing.referenceNumber,
+        // Keep the existing password unless a new one is supplied.
+        passwordHash: input.password ? hashPassword(input.password) : existing.passwordHash,
+        updatedAt: new Date(),
+      })
+      .where(eq(members.email, email))
+      .returning();
+    return updated ? toMember(updated) : null;
   }
 
-  const existing = database
-    .prepare("SELECT * FROM members WHERE email = ?")
-    .all(email) as Record<string, unknown>[];
-
-  if (existing.length > 0) {
-    const member = existing[0];
-    const paymentStatus = input.paymentStatus ?? String(member.payment_status ?? "PENDING");
-    const accessStatus = input.accessStatus ?? String(member.access_status ?? "RESERVED");
-    const amountPaid = input.amountPaid ?? Number(member.amount_paid ?? 0);
-    const agreeUpdates =
-      input.agreeUpdates ?? Number(member.agree_updates ?? 1) === 1;
-
-    database
-      .prepare(
-        `UPDATE members
-         SET first_name = ?, last_name = ?, phone = ?, country = ?, city = ?,
-             age_group = ?, interest = ?, experience = ?, goal = ?, source = ?,
-             agree_updates = ?, payment_status = ?, access_status = ?,
-             amount_paid = ?, reference_number = ?, password_hash = ?,
-             updated_at = ?
-         WHERE email = ?`,
-      )
-      .run(
-        sanitizeText(String(input.firstName ?? member.first_name ?? ""), 80),
-        sanitizeText(String(input.lastName ?? member.last_name ?? ""), 80),
-        sanitizeText(String(input.phone ?? member.phone ?? "")),
-        sanitizeText(String(input.country ?? member.country ?? "")),
-        sanitizeText(String(input.city ?? member.city ?? "")),
-        sanitizeText(String(input.ageGroup ?? member.age_group ?? "")),
-        sanitizeText(String(input.interest ?? member.interest ?? "")),
-        sanitizeText(String(input.experience ?? member.experience ?? "")),
-        sanitizeText(String(input.goal ?? member.goal ?? "")),
-        sanitizeText(String(input.source ?? member.source ?? "")),
-        agreeUpdates ? 1 : 0,
-        paymentStatus,
-        accessStatus,
-        amountPaid,
-        sanitizeText(String(input.referenceNumber ?? member.reference_number ?? ""), 80),
-        passwordHash,
-        now,
-        email,
-      );
-
-    const updated = database
-      .prepare("SELECT * FROM members WHERE email = ?")
-      .all(email) as Record<string, unknown>[];
-    return updated.length > 0 ? toMember(updated[0]) : null;
-  }
-
-  // Hash password before storing
-  const finalPasswordHash = input.password ? hashPassword(input.password) : "";
-
-  database
-    .prepare(
-      `INSERT INTO members (
-         email, first_name, last_name, phone, country, city, age_group, interest,
-         experience, goal, source, agree_updates, payment_status, access_status,
-         amount_paid, reference_number, password_hash, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .run(
+  const [created] = await db
+    .insert(members)
+    .values({
       email,
-      sanitizeText(String(input.firstName ?? "")),
-      sanitizeText(String(input.lastName ?? "")),
-      sanitizeText(String(input.phone ?? "")),
-      sanitizeText(String(input.country ?? "")),
-      sanitizeText(String(input.city ?? "")),
-      sanitizeText(String(input.ageGroup ?? "")),
-      sanitizeText(String(input.interest ?? "")),
-      sanitizeText(String(input.experience ?? "")),
-      sanitizeText(String(input.goal ?? "")),
-      sanitizeText(String(input.source ?? "")),
-      input.agreeUpdates === undefined ? 1 : input.agreeUpdates ? 1 : 0,
-      input.paymentStatus ?? "PENDING",
-      input.accessStatus ?? "RESERVED",
-      input.amountPaid ?? 0,
-      sanitizeText(String(input.referenceNumber ?? ""), 80),
-      finalPasswordHash,
-      now,
-      now,
-    );
-
-  const created = database
-    .prepare("SELECT * FROM members WHERE email = ?")
-    .all(email) as Record<string, unknown>[];
-  return created.length > 0 ? toMember(created[0]) : null;
+      firstName: sanitizeText(input.firstName, 80),
+      lastName: sanitizeText(input.lastName, 80),
+      phone: sanitizeText(input.phone),
+      country: sanitizeText(input.country),
+      city: sanitizeText(input.city),
+      ageGroup: sanitizeText(input.ageGroup),
+      interest: sanitizeText(input.interest),
+      experience: sanitizeText(input.experience),
+      goal: sanitizeText(input.goal),
+      source: sanitizeText(input.source),
+      agreeUpdates: input.agreeUpdates ?? true,
+      paymentStatus: input.paymentStatus ?? "PENDING",
+      accessStatus: input.accessStatus ?? "RESERVED",
+      amountPaid: input.amountPaid ?? 0,
+      referenceNumber: sanitizeText(input.referenceNumber, 80),
+      passwordHash: input.password ? hashPassword(input.password) : "",
+    })
+    .returning();
+  return created ? toMember(created) : null;
 }
 
-export function getMemberByEmail(email: string): Member | null {
-  const database = getDb();
-  const rows = database
-    .prepare("SELECT * FROM members WHERE email = ?")
-    .all(email.trim().toLowerCase()) as Record<string, unknown>[];
-  return rows.length > 0 ? toMember(rows[0]) : null;
+export async function getMemberByEmail(email: string): Promise<Member | null> {
+  const row = await findMemberRow(email.trim().toLowerCase());
+  return row ? toMember(row) : null;
 }
 
-export function markMemberPaidByReference(
+export async function markMemberPaidByReference(
   referenceNumber: string,
   email: string,
   amountPaid: number = site.pricing.earlyBird,
-): Member | null {
-  const database = getDb();
-  const now = new Date().toISOString();
+): Promise<Member | null> {
   const reference = referenceNumber.trim();
 
-  const byReference = database
-    .prepare("SELECT * FROM members WHERE reference_number = ?")
-    .all(reference) as Record<string, unknown>[];
-  const row = byReference[0];
-  const targetEmail = (email || String(row?.email ?? "")).trim().toLowerCase();
+  let targetEmail = (email || "").trim().toLowerCase();
+  if (!targetEmail && reference) {
+    const [byReference] = await db
+      .select({ email: members.email })
+      .from(members)
+      .where(eq(members.referenceNumber, reference))
+      .limit(1);
+    targetEmail = byReference?.email ?? "";
+  }
+  if (!targetEmail) return null;
 
-  const members = database
-    .prepare("SELECT * FROM members WHERE email = ?")
-    .all(targetEmail) as Record<string, unknown>[];
-
-  if (members.length === 0) return null;
-
-  database
-    .prepare(
-      `UPDATE members
-       SET payment_status = 'PAID', access_status = 'ACTIVE', amount_paid = ?,
-           reference_number = ?, updated_at = ?
-       WHERE email = ?`,
-    )
-    .run(amountPaid, reference, now, targetEmail);
-
-  const updated = database
-    .prepare("SELECT * FROM members WHERE email = ?")
-    .all(targetEmail) as Record<string, unknown>[];
-  return updated.length > 0 ? toMember(updated[0]) : null;
+  const [updated] = await db
+    .update(members)
+    .set({
+      paymentStatus: "PAID",
+      accessStatus: "ACTIVE",
+      amountPaid,
+      referenceNumber: reference,
+      updatedAt: new Date(),
+    })
+    .where(eq(members.email, targetEmail))
+    .returning();
+  return updated ? toMember(updated) : null;
 }
 
-export function markMemberPaid(email: string, amountPaid: number, referenceNumber: string): Member | null {
-  const member = getMemberByEmail(email);
+export async function markMemberPaid(
+  email: string,
+  amountPaid: number,
+  referenceNumber: string,
+): Promise<Member | null> {
+  const member = await getMemberByEmail(email);
   if (!member) return null;
   return markMemberPaidByReference(member.referenceNumber || referenceNumber, email, amountPaid);
 }
 
-export function addWaitlistSignup(email: string, firstName?: string, interest?: string): void {
-  const database = getDb();
-  const normalized = email.trim().toLowerCase();
-  database
-    .prepare(
-      `INSERT OR IGNORE INTO waitlist (email, created_at) VALUES (?, ?)`,
-    )
-    .run(normalized, new Date().toISOString());
-  void firstName;
-  void interest;
+export async function addWaitlistSignup(email: string, firstName?: string, interest?: string): Promise<void> {
+  await db
+    .insert(waitlist)
+    .values({
+      email: email.trim().toLowerCase(),
+      firstName: sanitizeText(firstName, 80),
+      interest: sanitizeText(interest, 120),
+    })
+    .onConflictDoNothing({ target: waitlist.email });
 }

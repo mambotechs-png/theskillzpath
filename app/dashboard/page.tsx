@@ -25,7 +25,7 @@ export default async function DashboardPage() {
     redirect("/enroll");
   }
 
-  const member = getMemberByEmail(email);
+  const member = await getMemberByEmail(email);
 
   if (!member || member.accessStatus !== "ACTIVE") {
     redirect("/enroll");
